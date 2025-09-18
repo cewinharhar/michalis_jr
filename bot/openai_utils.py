@@ -25,8 +25,12 @@ OPENAI_COMPLETION_OPTIONS = {
 
 
 class ChatGPT:
-    def __init__(self, model="gpt-3.5-turbo"):
-        assert model in {"text-davinci-003", "gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-1106-preview", "gpt-4-vision-preview"}, f"Unknown model: {model}"
+    def __init__(self, model=None):
+        if model is None:
+            model = config.models["available_text_models"][0]
+        supported_models = {"text-davinci-003", "gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-1106-preview", "gpt-4-vision-preview"}
+        supported_models.update(config.models["available_text_models"])
+        assert model in supported_models, f"Unknown model: {model}"
         self.model = model
 
     async def send_message(self, message, dialog_messages=[], chat_mode="assistant"):
@@ -37,7 +41,9 @@ class ChatGPT:
         answer = None
         while answer is None:
             try:
-                if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-1106-preview", "gpt-4-vision-preview"}:
+                chat_models = {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4-1106-preview", "gpt-4-vision-preview"}
+                chat_models.update(config.models["available_text_models"])
+                if self.model in chat_models:
                     messages = self._generate_prompt_messages(message, dialog_messages, chat_mode)
 
                     r = await openai.ChatCompletion.acreate(
@@ -78,7 +84,9 @@ class ChatGPT:
         answer = None
         while answer is None:
             try:
-                if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4","gpt-4o", "gpt-4-1106-preview"}:
+                chat_models = {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4","gpt-4o", "gpt-4-1106-preview"}
+                chat_models.update(config.models["available_text_models"])
+                if self.model in chat_models:
                     messages = self._generate_prompt_messages(message, dialog_messages, chat_mode)
 
                     r_gen = await openai.ChatCompletion.acreate(
@@ -231,8 +239,11 @@ class ChatGPT:
         ), n_first_dialog_messages_removed
 
     def _generate_prompt(self, message, dialog_messages, chat_mode):
+        from datetime import datetime
+        current_date = datetime.now().strftime("%A, %B %d, %Y")
+
         prompt = config.chat_modes[chat_mode]["prompt_start"]
-        prompt += "\n\n"
+        prompt += f"\n\nCurrent date: {current_date}\n\n"
 
         # add chat context
         if len(dialog_messages) > 0:
@@ -251,7 +262,11 @@ class ChatGPT:
         return base64.b64encode(image_buffer.read()).decode("utf-8")
 
     def _generate_prompt_messages(self, message, dialog_messages, chat_mode, image_buffer: BytesIO = None):
+        from datetime import datetime
+        current_date = datetime.now().strftime("%A, %B %d, %Y")
+
         prompt = config.chat_modes[chat_mode]["prompt_start"]
+        prompt += f"\n\nCurrent date: {current_date}"
 
         messages = [{"role": "system", "content": prompt}]
         
@@ -289,8 +304,14 @@ class ChatGPT:
         answer = answer.strip()
         return answer
 
-    def _count_tokens_from_messages(self, messages, answer, model="gpt-3.5-turbo"):
-        encoding = tiktoken.encoding_for_model(model)
+    def _count_tokens_from_messages(self, messages, answer, model=None):
+        if model is None:
+            model = config.models["available_text_models"][0]
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            # If model is not recognized by tiktoken, use GPT-4 encoding as fallback
+            encoding = tiktoken.encoding_for_model("gpt-4")
 
         if model == "gpt-3.5-turbo-16k":
             tokens_per_message = 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
@@ -308,6 +329,10 @@ class ChatGPT:
             tokens_per_message = 3
             tokens_per_name = 1
         elif model == "gpt-4o":
+            tokens_per_message = 3
+            tokens_per_name = 1
+        elif model in config.models["available_text_models"]:
+            # Treat config models as GPT-4 variants for token counting
             tokens_per_message = 3
             tokens_per_name = 1
         else:
@@ -340,7 +365,11 @@ class ChatGPT:
         return n_input_tokens, n_output_tokens
 
     def _count_tokens_from_prompt(self, prompt, answer, model="text-davinci-003"):
-        encoding = tiktoken.encoding_for_model(model)
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            # If model is not recognized by tiktoken, use GPT-4 encoding as fallback
+            encoding = tiktoken.encoding_for_model("gpt-4")
 
         n_input_tokens = len(encoding.encode(prompt)) + 1
         n_output_tokens = len(encoding.encode(answer))

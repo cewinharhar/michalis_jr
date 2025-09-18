@@ -32,6 +32,7 @@ import database
 import openai_utils
 
 import base64
+from duckduckgo_search import DDGS
 
 # setup
 db = database.Database()
@@ -70,6 +71,76 @@ def split_text_into_chunks(text, chunk_size):
         yield text[i:i + chunk_size]
 
 
+async def search_web(query: str, max_results: int = 5):
+    results = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append(r)
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+    return results
+
+
+async def optimize_search_query(user_query: str) -> str:
+    """Use LLM to optimize search query with search engine operators"""
+    try:
+        optimization_prompt = """You are a search query optimizer. Your job is to take a user's natural language query and convert it into an optimized search engine query using proper search operators.
+
+Use these search operators when appropriate:
+- AND: to require multiple terms (default behavior, so usually omit)
+- OR: to find either term (use when user wants alternatives)
+- "exact phrase": use quotes for exact phrases or specific terms
+- -exclude: use minus to exclude terms
+- site:domain.com: to search specific websites
+- filetype:pdf: to find specific file types
+- intitle: to find terms in page titles
+- inurl: to find terms in URLs
+
+Rules:
+1. Keep the query concise and focused
+2. Use quotes for proper nouns, specific phrases, or technical terms
+3. Add relevant keywords that might help find better results
+4. Don't over-optimize - keep it readable
+5. Consider synonyms for better coverage
+6. Add current year if the query seems time-sensitive
+
+Examples:
+User: "python tutorial for beginners"
+Optimized: "python tutorial" beginners 2024
+
+User: "best restaurants near me"
+Optimized: "best restaurants" reviews 2024
+
+User: "how to fix iphone battery"
+Optimized: "iphone battery" fix repair guide
+
+User: "latest news about AI"
+Optimized: "artificial intelligence" OR "AI" news 2024
+
+Now optimize this query: {user_query}
+
+Return ONLY the optimized query, nothing else."""
+
+        chatgpt_instance = openai_utils.ChatGPT()
+        messages = [{"role": "system", "content": optimization_prompt.format(user_query=user_query)}]
+
+        response = await openai.ChatCompletion.acreate(
+            model=config.models["available_text_models"][0],
+            messages=messages,
+            temperature=0.3,
+            max_tokens=500
+        )
+
+        optimized_query = response.choices[0].message.content.strip()
+        logger.info(f"Query optimization: '{user_query}' -> '{optimized_query}'")
+        return optimized_query
+
+    except Exception as e:
+        logger.error(f"Query optimization error: {e}")
+        return user_query  # Return original query if optimization fails
+
+
 async def register_user_if_not_exists(update: Update, context: CallbackContext, user: User):
     if not db.check_if_user_exists(user.id):
         db.add_new_user(
@@ -94,7 +165,7 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
     n_used_tokens = db.get_user_attribute(user.id, "n_used_tokens")
     if isinstance(n_used_tokens, int) or isinstance(n_used_tokens, float):  # old format
         new_n_used_tokens = {
-            "gpt-3.5-turbo": {
+            config.models["available_text_models"][0]: {
                 "n_input_tokens": 0,
                 "n_output_tokens": n_used_tokens
             }
@@ -111,22 +182,149 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
 
 
 async def is_bot_mentioned(update: Update, context: CallbackContext):
-     try:
-         message = update.message
+    """
+    Enhanced function to check if the bot is mentioned in a group chat.
+    Returns True for private chats, or if bot is mentioned/replied to in groups.
+    """
+    try:
+        message = update.message
+        if not message:
+            return False
 
-         if message.chat.type == "private":
-             return True
+        # Always respond in private chats
+        if message.chat.type == "private":
+            return True
 
-         if message.text is not None and ("@" + context.bot.username) in message.text:
-             return True
+        bot_username = context.bot.username
+        if not bot_username:
+            logger.warning("Bot username not available for mention detection")
+            return True  # Default to responding if we can't check
 
-         if message.reply_to_message is not None:
-             if message.reply_to_message.from_user.id == context.bot.id:
-                 return True
-     except:
-         return True
-     else:
-         return False
+        # Check for @botname mentions in message text
+        message_text = message.text or ""
+        if message_text and f"@{bot_username}" in message_text:
+            return True
+
+        # Check for @botname mentions in caption (for photos/videos/documents)
+        caption_text = message.caption or ""
+        if caption_text and f"@{bot_username}" in caption_text:
+            return True
+
+        # Check if replying to bot's message
+        if message.reply_to_message and message.reply_to_message.from_user:
+            if message.reply_to_message.from_user.id == context.bot.id:
+                return True
+
+        # Check message entities for mentions (more robust detection)
+        if message.entities:
+            for entity in message.entities:
+                if entity.type == "mention":
+                    # Extract the mentioned username from the text
+                    start = entity.offset
+                    end = entity.offset + entity.length
+                    mentioned_user = message_text[start:end]
+                    if mentioned_user == f"@{bot_username}":
+                        return True
+
+        # Check caption entities for mentions
+        if message.caption_entities:
+            for entity in message.caption_entities:
+                if entity.type == "mention":
+                    # Extract the mentioned username from the caption
+                    start = entity.offset
+                    end = entity.offset + entity.length
+                    mentioned_user = caption_text[start:end]
+                    if mentioned_user == f"@{bot_username}":
+                        return True
+
+        return False
+
+    except AttributeError as e:
+        logger.error(f"AttributeError in is_bot_mentioned: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error in is_bot_mentioned: {e}")
+        return False
+
+
+def clean_message_text(message_text: str, bot_username: str) -> str:
+    """
+    Remove bot mentions from message text in a more robust way.
+    Handles various mention formats and positions.
+    """
+    if not message_text or not bot_username:
+        return message_text or ""
+
+    import re
+
+    # Create pattern to match @botname mentions
+    # This pattern handles:
+    # - @botname at the beginning
+    # - @botname in the middle
+    # - @botname at the end
+    # - Multiple @botname mentions
+    mention_pattern = rf"@{re.escape(bot_username)}"
+
+    # Remove all mentions of the bot
+    cleaned_text = re.sub(mention_pattern, "", message_text, flags=re.IGNORECASE)
+
+    # Clean up extra whitespace
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+
+    return cleaned_text
+
+
+def get_chat_info(update: Update) -> dict:
+    """
+    Extract relevant chat information for logging and debugging.
+    """
+    if not update or not update.message:
+        return {}
+
+    chat = update.message.chat
+    user = update.message.from_user
+
+    return {
+        "chat_id": chat.id,
+        "chat_type": chat.type,
+        "chat_title": getattr(chat, 'title', None),
+        "user_id": user.id if user else None,
+        "username": user.username if user else None,
+        "is_bot": user.is_bot if user else None,
+    }
+
+
+async def log_group_interaction(update: Update, context: CallbackContext, interaction_type: str):
+    """
+    Log group chat interactions for debugging and monitoring.
+    """
+    try:
+        chat_info = get_chat_info(update)
+        if chat_info.get("chat_type") != "private":
+            logger.info(f"Group interaction - {interaction_type}: "
+                       f"Chat: {chat_info.get('chat_title', 'Unknown')} ({chat_info.get('chat_id')}), "
+                       f"User: {chat_info.get('username', 'Unknown')} ({chat_info.get('user_id')})")
+    except Exception as e:
+        logger.error(f"Error logging group interaction: {e}")
+
+
+async def validate_group_chat_setup(context: CallbackContext) -> bool:
+    """
+    Validate that the bot is properly configured for group chat interactions.
+    """
+    try:
+        if not context.bot:
+            logger.error("Bot context is not available")
+            return False
+
+        if not context.bot.username:
+            logger.error("Bot username is not available - this is required for group chat mentions")
+            return False
+
+        return True
+    except Exception as e:
+        logger.error(f"Error validating group chat setup: {e}")
+        return False
 
 
 async def start_handle(update: Update, context: CallbackContext):
@@ -136,7 +334,7 @@ async def start_handle(update: Update, context: CallbackContext):
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
     db.start_new_dialog(user_id)
 
-    reply_text = "Hi! I'm <b>ChatGPT</b> bot implemented with OpenAI API 🤖\n\n"
+    reply_text = "Hi! I'm Michalis Jr🤖\n\n"
     reply_text += HELP_MESSAGE
 
     await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
@@ -159,6 +357,59 @@ async def help_group_chat_handle(update: Update, context: CallbackContext):
 
      await update.message.reply_text(text, parse_mode=ParseMode.HTML)
      await update.message.reply_video(config.help_group_chat_video_path)
+
+
+async def search_handle(update: Update, context: CallbackContext):
+    await register_user_if_not_exists(update, context, update.message.from_user)
+    user_id = update.message.from_user.id
+    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+
+    if not context.args:
+        await update.message.reply_text("❓ Usage: /search <query>")
+        return
+
+    query = " ".join(context.args)
+
+    # In group chats, check if the bot is mentioned or the command is direct
+    if update.message.chat.type != "private":
+        if not await is_bot_mentioned(update, context):
+            return
+
+    await update.message.chat.send_action(action="typing")
+
+    # Optimize the search query using LLM
+    optimized_query = await optimize_search_query(query)
+
+    results = await search_web(optimized_query, max_results=5)
+
+    if not results:
+        await update.message.reply_text("🥲 No results found.")
+        return
+
+    if optimized_query != query:
+        reply_text = f"🔎 Results for \"{query}\":\n<i>🔧 Optimized query: {optimized_query}</i>\n\n"
+    else:
+        reply_text = f"🔎 Results for \"{query}\":\n\n"
+    for i, r in enumerate(results, start=1):
+        title = r.get("title", "No title")
+        link = r.get("href", "")
+        snippet = r.get("body", "")
+        reply_text += f"{i}. <b>{title}</b>\n{snippet}\n🔗 {link}\n\n"
+
+    await update.message.reply_text(
+        reply_text[:4000],
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+    # Store search query and results in dialog history
+    search_user_message = f"/search {query}"
+    new_dialog_message = {"user": [{"type": "text", "text": search_user_message}], "bot": reply_text[:4000], "date": datetime.now()}
+    db.set_dialog_messages(
+        user_id,
+        db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
+        dialog_id=None
+    )
 
 
 async def retry_handle(update: Update, context: CallbackContext):
@@ -335,9 +586,18 @@ async def unsupport_message_handle(update: Update, context: CallbackContext, mes
     return
 
 async def message_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
+    # validate group chat setup for non-private chats
+    if update.message and update.message.chat.type != "private":
+        if not await validate_group_chat_setup(context):
+            logger.error("Group chat setup validation failed")
+            return
+
     # check if bot was mentioned (for group chats)
     if not await is_bot_mentioned(update, context):
         return
+
+    # log group interactions for debugging
+    await log_group_interaction(update, context, "message_received")
 
     # check if message is edited
     if update.edited_message is not None:
@@ -346,9 +606,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
     _message = message or update.message.text
 
-    # remove bot mention (in group chats)
+    # remove bot mention (in group chats) using enhanced cleaning
     if update.message.chat.type != "private":
-        _message = _message.replace("@" + context.bot.username, "").strip()
+        _message = clean_message_text(_message, context.bot.username)
 
     await register_user_if_not_exists(update, context, update.message.from_user)
     if await is_previous_message_not_answered_yet(update, context): return
@@ -380,9 +640,16 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             # send typing action
             await update.message.chat.send_action(action="typing")
 
-            if _message is None or len(_message) == 0:
-                 await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
-                 return
+            if _message is None or len(_message.strip()) == 0:
+                if update.message.chat.type == "private":
+                    await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
+                else:
+                    # In group chats, provide more helpful guidance
+                    await update.message.reply_text(
+                        f"👋 Hi! You mentioned me but didn't include a message. Try: <code>@{context.bot.username} your question here</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+                return
 
             dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
             parse_mode = {
@@ -502,9 +769,18 @@ async def is_previous_message_not_answered_yet(update: Update, context: Callback
 
 
 async def voice_message_handle(update: Update, context: CallbackContext):
+    # validate group chat setup for non-private chats
+    if update.message and update.message.chat.type != "private":
+        if not await validate_group_chat_setup(context):
+            logger.error("Group chat setup validation failed for voice message")
+            return
+
     # check if bot was mentioned (for group chats)
     if not await is_bot_mentioned(update, context):
         return
+
+    # log group interactions for debugging
+    await log_group_interaction(update, context, "voice_message_received")
 
     await register_user_if_not_exists(update, context, update.message.from_user)
     if await is_previous_message_not_answered_yet(update, context): return
@@ -566,7 +842,7 @@ async def new_dialog_handle(update: Update, context: CallbackContext):
 
     user_id = update.message.from_user.id
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
-    db.set_user_attribute(user_id, "current_model", "gpt-3.5-turbo")
+    db.set_user_attribute(user_id, "current_model", config.models["available_text_models"][0])
 
     db.start_new_dialog(user_id)
     await update.message.reply_text("Starting new dialog ✅")
@@ -816,6 +1092,7 @@ async def post_init(application: Application):
         BotCommand("/new", "Start new dialog"),
         BotCommand("/mode", "Select chat mode"),
         BotCommand("/retry", "Re-generate response for previous query"),
+        BotCommand("/search", "Search the web"),
         BotCommand("/balance", "Show balance"),
         BotCommand("/settings", "Show settings"),
         BotCommand("/help", "Show help message"),
@@ -845,6 +1122,7 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("start", start_handle, filters=user_filter))
     application.add_handler(CommandHandler("help", help_handle, filters=user_filter))
     application.add_handler(CommandHandler("help_group_chat", help_group_chat_handle, filters=user_filter))
+    application.add_handler(CommandHandler("search", search_handle, filters=user_filter))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, message_handle))
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & user_filter, message_handle))
